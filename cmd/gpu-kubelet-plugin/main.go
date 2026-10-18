@@ -68,6 +68,7 @@ type Flags struct {
 	klogVerbosity                 int
 	additionalXidsToIgnore        string
 	consumableShares              string
+	gpuModuleMappingFile          string
 }
 
 type Config struct {
@@ -209,6 +210,12 @@ func newApp() *cli.App {
 			Value:       "/metrics",
 			Destination: &flags.metricsPath,
 			EnvVars:     []string{"METRICS_PATH"},
+		},
+		&cli.StringFlag{
+			Name:        "gpu-module-mapping-file",
+			Usage:       "Path to a JSON file mapping each GPU PCI bus ID to its module ID. When set, GPUs stay bound to vfio-pci and are discovered without NVML or a host NVIDIA driver.",
+			Destination: &flags.gpuModuleMappingFile,
+			EnvVars:     []string{"GPU_MODULE_MAPPING_FILE"},
 		},
 		&cli.StringFlag{
 			Name:        "consumable-shares",

@@ -129,7 +129,7 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 	klog.Infof("Using devRoot=%v", devRoot)
 
 	hostRoot := root(config.flags.hostRoot)
-	nvdevlib, err := newDeviceLib(containerDriverRoot, hostRoot)
+	nvdevlib, err := newDeviceLib(containerDriverRoot, hostRoot, config.flags.gpuModuleMappingFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create device library: %w", err)
 	}
@@ -196,7 +196,7 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 
 	var vfioPciManager *VfioPciManager
 	if featuregates.Enabled(featuregates.PassthroughSupport) {
-		vfioPciManager, err = NewVfioPciManager(string(containerDriverRoot), string(hostDriverRoot), nvdevlib, true /* nvidiaEnabled */)
+		vfioPciManager, err = NewVfioPciManager(string(containerDriverRoot), string(hostDriverRoot), nvdevlib, !nvdevlib.driverless())
 		if err != nil {
 			return nil, fmt.Errorf("unable to create vfio pci manager: %w", err)
 		}
@@ -236,6 +236,18 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 		for _, gpu := range nvdevlib.gpuInfosByUUID {
 			if err := state.attachFabricManagerPartitions(gpu); err != nil {
 				return nil, fmt.Errorf("attaching fabric manager partitions for GPU %s: %w", gpu.CanonicalName(), err)
+			}
+		}
+		if nvdevlib.driverless() {
+			for _, devices := range perGPUAllocatable.allocatablesMap {
+				for _, dev := range devices {
+					if dev.Vfio == nil || dev.Vfio.parent == nil {
+						continue
+					}
+					if err := state.attachFabricManagerPartitions(dev.Vfio.parent); err != nil {
+						return nil, fmt.Errorf("attaching fabric manager partitions for GPU %s: %w", dev.Vfio.PciBusID, err)
+					}
+				}
 			}
 		}
 	}
@@ -1242,6 +1254,10 @@ func (s *DeviceState) discoverSiblingAllocatables(device *AllocatableDevice) err
 			return fmt.Errorf("error adding allocatable device: %w", err)
 		}
 	case VfioDeviceType:
+		if s.nvdevlib.driverless() {
+			// The GPU stays on vfio-pci; keep the parent built from the mapping.
+			return nil
+		}
 		gpu, _, err := s.nvdevlib.discoverGPUByPCIBusID(device.Vfio.PciBusID)
 		if err != nil {
 			return fmt.Errorf("error discovering gpu by pci bus id: %w", err)

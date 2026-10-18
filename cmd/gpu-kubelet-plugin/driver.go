@@ -158,7 +158,7 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 	}
 	driver.healthcheck = healthcheck
 
-	if featuregates.Enabled(featuregates.NVMLDeviceHealthCheck) {
+	if featuregates.Enabled(featuregates.NVMLDeviceHealthCheck) && !state.nvdevlib.driverless() {
 		deviceHealthMonitor, err := newNvmlDeviceHealthMonitor(config, state.perGPUAllocatable, state.nvdevlib)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create NVML device health monitor: %w", err)

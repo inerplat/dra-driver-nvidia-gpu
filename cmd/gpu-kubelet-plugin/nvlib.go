@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -53,16 +54,29 @@ type deviceLib struct {
 	gpuInfosByUUID    map[string]*GpuInfo
 	gpuUUIDbyPCIBusID map[PCIBusID]string
 	devhandleByUUID   map[string]nvml.Device
+	// moduleIDByPCIBusID is set in driverless mode, where GPUs stay on
+	// vfio-pci and NVML cannot see them.
+	moduleIDByPCIBusID map[PCIBusID]int
 }
 
-func newDeviceLib(driverRoot root, hostRoot root) (*deviceLib, error) {
+func (l deviceLib) driverless() bool { return l.moduleIDByPCIBusID != nil }
+
+func newDeviceLib(driverRoot root, hostRoot root, moduleMappingFile string) (*deviceLib, error) {
+	var moduleIDs map[PCIBusID]int
+	if moduleMappingFile != "" {
+		var err error
+		if moduleIDs, err = readModuleMapping(moduleMappingFile); err != nil {
+			return nil, err
+		}
+	}
+
 	driverLibraryPath, err := driverRoot.getDriverLibraryPath()
-	if err != nil {
+	if err != nil && moduleIDs == nil {
 		return nil, fmt.Errorf("failed to locate driver libraries: %w", err)
 	}
 
 	nvidiaSMIPath, err := driverRoot.getNvidiaSMIPath()
-	if err != nil {
+	if err != nil && moduleIDs == nil {
 		return nil, fmt.Errorf("failed to locate nvidia-smi: %w", err)
 	}
 
@@ -94,6 +108,8 @@ func newDeviceLib(driverRoot root, hostRoot root) (*deviceLib, error) {
 		gpuInfosByUUID:    make(map[string]*GpuInfo),
 		gpuUUIDbyPCIBusID: make(map[PCIBusID]string),
 		devhandleByUUID:   make(map[string]nvml.Device),
+
+		moduleIDByPCIBusID: moduleIDs,
 	}
 
 	// Current design: when DynamicMIG is enabled, use one long-lived NVML
@@ -210,6 +226,11 @@ func (l deviceLib) enumerateAllPossibleDevices() (*PerGPUAllocatableDevices, err
 // provided to limit the discovery to a set of physical GPUs.
 func (l deviceLib) GetPerGpuAllocatableDevices(indices ...int) (*PerGPUAllocatableDevices, error) {
 	klog.Infof("Traverse GPU devices")
+
+	if l.driverless() {
+		klog.Infof("Driverless mode: skipping NVML discovery")
+		return &PerGPUAllocatableDevices{allocatablesMap: make(map[PCIBusID]AllocatableDevices)}, nil
+	}
 
 	shutdown, ret := l.ensureNVML()
 	if ret != nvml.SUCCESS {
@@ -654,6 +675,11 @@ func (l deviceLib) enumerateGpuVfioDevices(perGPUAllocatable *PerGPUAllocatableD
 	if err != nil {
 		return fmt.Errorf("error getting GPU PCI devices: %w", err)
 	}
+	if l.driverless() {
+		if err := validateModuleMapping(l.moduleIDByPCIBusID, gpuPciDevices); err != nil {
+			return err
+		}
+	}
 
 	// For each discovered PCI device, look up the corresponding full-GPU-device
 	// and construct a corresponding new `AllocatableDevice` object.
@@ -673,6 +699,13 @@ func (l deviceLib) enumerateGpuVfioDevices(perGPUAllocatable *PerGPUAllocatableD
 
 		if parent != nil {
 			vfioDeviceInfo.parent = parent.Gpu
+		} else if l.driverless() {
+			vfioDeviceInfo.parent = &GpuInfo{
+				UUID:        "PCI-" + pci.Address,
+				pciBusID:    pci.Address,
+				vfioEnabled: true,
+				gpuModuleID: l.moduleIDByPCIBusID[pci.Address],
+			}
 		} else {
 			// Its likely that the parent is nil because the GPU is prepared in passthrough mode.
 			klog.Warningf("Skipping association with parent GPU device for VFIO device: %s", pci.Address)
@@ -1541,4 +1574,46 @@ func isDynamicMIGCapable(gpuInfo *GpuInfo, dev nvdev.Device) (bool, error) {
 
 	klog.Infof("GPU %s: MIG mode is disabled and cannot be toggled without GPU reset", gpuInfo.String())
 	return false, nil
+}
+
+// readModuleMapping reads a JSON object mapping GPU PCI bus IDs to module IDs.
+func readModuleMapping(path string) (map[PCIBusID]int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading GPU module mapping %q: %w", path, err)
+	}
+	var mapping map[PCIBusID]int
+	if err := json.Unmarshal(data, &mapping); err != nil {
+		return nil, fmt.Errorf("parsing GPU module mapping %q: %w", path, err)
+	}
+	if mapping == nil {
+		mapping = map[PCIBusID]int{}
+	}
+	return mapping, nil
+}
+
+// validateModuleMapping requires the mapping to cover exactly the GPUs on
+// this node, with unique positive module IDs.
+func validateModuleMapping(mapping map[PCIBusID]int, gpus []*nvpci.NvidiaPCIDevice) error {
+	onNode := map[PCIBusID]bool{}
+	for _, gpu := range gpus {
+		onNode[gpu.Address] = true
+		if _, ok := mapping[gpu.Address]; !ok {
+			return fmt.Errorf("GPU module mapping has no entry for GPU %s", gpu.Address)
+		}
+	}
+	seen := map[int]PCIBusID{}
+	for bdf, id := range mapping {
+		if !onNode[bdf] {
+			return fmt.Errorf("GPU module mapping lists %s, which is not a GPU on this node", bdf)
+		}
+		if id <= 0 {
+			return fmt.Errorf("GPU module mapping gives %s the invalid module ID %d", bdf, id)
+		}
+		if other, dup := seen[id]; dup {
+			return fmt.Errorf("GPU module mapping gives module ID %d to both %s and %s", id, other, bdf)
+		}
+		seen[id] = bdf
+	}
+	return nil
 }
