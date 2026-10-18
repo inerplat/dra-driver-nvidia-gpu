@@ -50,7 +50,8 @@ func (r root) getDriverLibraryPath() (string, error) {
 func (r root) getFMLibraryPath() (string, error) {
 	libraryPath, err := r.findFile("libnvfm.so", librarySearchPaths...)
 	if err != nil {
-		return "", err
+		// Fabric Manager packages may ship only the versioned soname.
+		return r.findFile("libnvfm.so.1", librarySearchPaths...)
 	}
 	return libraryPath, nil
 }
