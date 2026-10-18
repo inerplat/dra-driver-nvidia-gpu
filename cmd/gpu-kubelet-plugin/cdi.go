@@ -184,9 +184,16 @@ func (cdi *CDIHandler) CreateClaimSpecFile(claimUID string, preparedDevices Prep
 	// `nvcdiDevice.GetCommonEdits()` may usually initialize nvsandboxutilslib
 	// under the hood -- we now prevent that from happening by using
 	// `nvcdi.FeatureDisableNvsandboxUtils` above.
-	commonEdits, err := cdi.GetCommonEditsCached()
-	if err != nil {
-		return fmt.Errorf("failed to get common CDI spec edits: %w", err)
+	// A claim made only of VFIO devices replaces the common edits with its
+	// VFIO config edits below, and needs no driver files, which a node
+	// without a host driver does not have.
+	commonEdits := &cdiapi.ContainerEdits{ContainerEdits: &cdispec.ContainerEdits{}}
+	if !onlyVfioDevices(preparedDevices) {
+		var err error
+		commonEdits, err = cdi.GetCommonEditsCached()
+		if err != nil {
+			return fmt.Errorf("failed to get common CDI spec edits: %w", err)
+		}
 	}
 
 	var deviceSpecs []cdispec.Device
@@ -373,4 +380,15 @@ func (cdi *CDIHandler) writeSpec(spec spec.Interface, specName string) error {
 
 	klog.V(7).Infof("Write CDI spec: %s", specName)
 	return spec.Save(filepath.Join(cdi.cdiRoot, specName+".yaml"))
+}
+
+func onlyVfioDevices(preparedDevices PreparedDevices) bool {
+	for _, group := range preparedDevices {
+		for _, dev := range group.Devices {
+			if dev.Type() != VfioDeviceType {
+				return false
+			}
+		}
+	}
+	return true
 }
